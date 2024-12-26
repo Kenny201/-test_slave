@@ -2,126 +2,180 @@
 
 namespace Tests\Feature;
 
+use App\Jobs\ImportRowsJob;
 use App\Models\User;
-use Exception;
+use App\Services\FileUploadService;
+use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Http\UploadedFile;
-use Illuminate\Testing\TestResponse;
-use Mockery;
-use PHPUnit\Framework\Attributes\DataProvider;
+use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Facades\Redis;
+use Illuminate\Support\Facades\Storage;
 use Tests\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
 
 class FileUploadControllerTest extends TestCase
 {
-    /** Табличные данные для тестов. */
-    public static function uploadDataProvider(): array
+    use RefreshDatabase;
+
+    private User $user;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+        $this->user = User::factory()->create();
+    }
+
+    #[DataProvider('uploadFormAccessProvider')]
+    public function test_upload_form_access(bool $isAuthorized, int $expectedStatus): void
+    {
+        $request = $isAuthorized ? $this->actingAs($this->user) : $this;
+
+        $response = $request->get(route('upload.form'));
+
+        $response->assertStatus($expectedStatus);
+    }
+
+    public static function uploadFormAccessProvider(): array
     {
         return [
-            'successful_upload' => [
-                'user' => 'create',
-                'fileType' => 'xlsx',
+            'authorized user can access upload form' => [
+                'isAuthorized' => true,
                 'expectedStatus' => 200,
-                'expectedJson' => ['message' => 'File uploaded and processed successfully'],
-                'mockParse' => ['parse' => [['date' => '23.12.2024', 'name' => 'Test Name', 'id' => 1]]],
-                'expectedException' => null
             ],
-
-            'unauthorized_user' => [
-                'user' => null,
-                'fileType' => 'xlsx',
+            'unauthorized user cannot access upload form' => [
+                'isAuthorized' => false,
                 'expectedStatus' => 401,
-                'expectedJson' => [],
-                'mockParse' => null,
-                'expectedException' => null
             ],
-
-            'invalid_file_type' => [
-                'user' => 'create',
-                'fileType' => 'txt',
-                'expectedStatus' => 422,
-                'expectedJson' => ['message' => 'The file field must be a file of type: xlsx.'],
-                'mockParse' => null,
-                'expectedException' => null
-            ],
-
-            'parsing_error' => [
-                'user' => 'create',
-                'fileType' => 'xlsx',
-                'expectedStatus' => 422,
-                'expectedJson' => ['message' => 'Error parsing the file'],
-                'mockParse' => new Exception('Error parsing the file'),
-                'expectedException' => 'Exception'
-            ],
-
-            'missing_file' => [
-                'user' => 'create',
-                'fileType' => null,
-                'expectedStatus' => 422,
-                'expectedJson' => ['message' => 'The file field is required.'],
-                'mockParse' => null,
-                'expectedException' => null
-            ]
         ];
     }
 
-    #[DataProvider('uploadDataProvider')]
-    public function test_file_upload($user, $fileType, $expectedStatus, $expectedJson, $mockParse, $expectedException)
-    {
-        $userInstance = $this->getUserInstance($user);
+    #[DataProvider('progressDataProvider')]
+    public function test_progress_endpoint(
+        int $progress,
+        int $totalRows,
+        bool $importStatus,
+        array $expectedJson
+    ): void {
+        Redis::shouldReceive('get')
+            ->with("import_progress:{$this->user->id}")
+            ->andReturn($progress);
 
-        $file = $this->createFile($fileType);
+        Redis::shouldReceive('get')
+            ->with("import_total_rows:{$this->user->id}")
+            ->andReturn($totalRows);
 
-        $this->mockFileParser($mockParse, $expectedException);
+        Redis::shouldReceive('get')
+            ->with("import_status:{$this->user->id}")
+            ->andReturn($importStatus);
 
-        $response = $this->sendFileUploadRequest($userInstance, $file);
-        $this->assertResponse($response, $expectedStatus, $expectedJson);
+        $response = $this->actingAs($this->user)->get('/upload/progress');
+
+        $response->assertStatus(200)
+            ->assertJson($expectedJson);
     }
 
-    /** Получить или создать пользователя. */
-    private function getUserInstance(?string $user): ?User
+    public static function progressDataProvider(): array
     {
-        if ($user === 'create') {
-            return User::factory()->create();
+        return [
+            'returns correct progress data' => [
+                'progress' => 50,
+                'totalRows' => 100,
+                'importStatus' => true,
+                'expectedJson' => [
+                    'progress' => 50.0,
+                    'isImporting' => true,
+                ],
+            ],
+            'returns zero progress' => [
+                'progress' => 0,
+                'totalRows' => 100,
+                'importStatus' => false,
+                'expectedJson' => [
+                    'progress' => 0.0,
+                    'isImporting' => false,
+                ],
+            ],
+            'returns completed progress' => [
+                'progress' => 100,
+                'totalRows' => 100,
+                'importStatus' => false,
+                'expectedJson' => [
+                    'progress' => 100.0,
+                    'isImporting' => false,
+                ],
+            ],
+        ];
+    }
+
+    #[DataProvider('fileUploadProvider')]
+    public function test_file_upload(
+        ?string $mimeType,
+        int $size,
+        bool $shouldPass,
+        ?string $errorMessage = null
+    ): void {
+        Storage::fake('local');
+        Queue::fake();
+
+        $file = $mimeType ?
+            UploadedFile::fake()->create(
+                'test.xlsx',
+                $size,
+                $mimeType
+            ) :
+            null;
+
+        $this->mock(FileUploadService::class, function ($mock) {
+            $mock->shouldReceive('storeFile')
+                ->andReturn('temp/test.xlsx');
+        });
+
+        $response = $this->actingAs($this->user)
+            ->from(route('upload.form'))
+            ->post(route('upload.handle'), [
+                'file' => $file
+            ]);
+
+        if ($shouldPass) {
+            $response->assertRedirect(route('upload.form'))
+                ->assertSessionHas('success', 'File uploaded and processed successfully');
+
+            Queue::assertPushed(ImportRowsJob::class);
+        } else {
+            $response->assertRedirect()
+                ->assertSessionHasErrors(['file' => $errorMessage]);
         }
-        return null;
     }
 
-    /** Создать файл в зависимости от типа. */
-    private function createFile(?string $fileType): ?UploadedFile
+
+
+
+    public static function fileUploadProvider(): array
     {
-        return $fileType ? UploadedFile::fake()->create("file.$fileType", 1024) : null;
-    }
-
-    /** Мокаем сервис парсера. */
-    private function mockFileParser(mixed $mockParse, ?string $expectedException): void
-    {
-        if ($mockParse) {
-            $fileParserMock = Mockery::mock('App\Services\FileParsers\FileParserInterface');
-            if ($expectedException) {
-                $fileParserMock->shouldReceive('parse')->once()->andThrow($mockParse);
-            } else {
-                $fileParserMock->shouldReceive('parse')->once()->andReturn($mockParse['parse']);
-            }
-
-            $this->app->instance('App\Services\FileParsers\FileParserInterface', $fileParserMock);
-        }
-    }
-
-    /** Отправить запрос на загрузку файла. */
-    private function sendFileUploadRequest(?User $userInstance, ?UploadedFile $file): TestResponse
-    {
-        return $userInstance
-            ? $this->actingAs($userInstance)->postJson('upload', $file ? ['file' => $file] : [])
-            : $this->postJson('upload', $file ? ['file' => $file] : []);
-    }
-
-    /** Проверка статуса и JSON ответа. */
-    private function assertResponse(TestResponse $response, int $expectedStatus, ?array $expectedJson): void
-    {
-        $response->assertStatus($expectedStatus);
-
-        if ($expectedJson) {
-            $response->assertJson($expectedJson);
-        }
+        return [
+            'successful xlsx upload' => [
+                'mimeType' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                'size' => 1000,
+                'shouldPass' => true,
+            ],
+            'file too large' => [
+                'mimeType' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                'size' => 3000,
+                'shouldPass' => false,
+                'errorMessage' => 'Размер файла не должен превышать 2 МБ.',
+            ],
+            'wrong mime type' => [
+                'mimeType' => 'text/plain',
+                'size' => 1000,
+                'shouldPass' => false,
+                'errorMessage' => 'Файл должен быть формата Excel (xlsx).',
+            ],
+            'no file provided' => [
+                'mimeType' => null,
+                'size' => 0,
+                'shouldPass' => false,
+                'errorMessage' => 'Пожалуйста, выберите файл для загрузки.',
+            ],
+        ];
     }
 }
-
