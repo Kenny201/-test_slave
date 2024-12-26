@@ -13,7 +13,7 @@ class RowFactory extends Factory
     {
         return [
             'name' => $this->faker->name(),
-            'date' => $this->faker->dateTimeBetween('-1 year', 'now')->format('d.m.Y'),
+            'date' => $this->faker->dateTimeBetween('-1 year', 'now')->format('Y-m-d'),
         ];
     }
 }
